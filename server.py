@@ -426,25 +426,36 @@ async def discord_play_audio(
     `channel_id`: The ID of the Discord voice channel (e.g. from `discord_list_channels`).
     `audio_source`: Can be a YouTube URL (e.g. 'https://www.youtube.com/watch?v=...'), a local audio file path (e.g. '/tmp/stefan_theme.mp3'), or a direct stream URL.
     """
-    ch = bot.get_channel(int(channel_id))
-    if not ch or not isinstance(ch, discord.VoiceChannel):
-        return {"error": f"Voice channel {channel_id} not found"}
+    import subprocess
+    # Stop any prior detached play_song processes
+    subprocess.run(["pkill", "-f", "play_song.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    try:
-        res = await voice.play_audio(ch, audio_source=audio_source, volume=volume)
-        return {"success": True, **res}
-    except Exception as e:
-        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
-        logger.error("Audio playback error: %s", err_msg, exc_info=True)
-        return {"error": err_msg}
+    script_path = os.path.join(os.path.dirname(__file__), "play_song.py")
+    python_bin = sys.executable
+
+    # Spawn in a detached session so audio playback continues independently of stdio MCP lifecycle
+    proc = subprocess.Popen(
+        [python_bin, script_path, str(channel_id), str(audio_source)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    return {
+        "success": True,
+        "status": "playing",
+        "channel_id": str(channel_id),
+        "source": audio_source,
+        "pid": proc.pid,
+    }
 
 
 @mcp.tool()
 async def discord_stop_audio(guild_id: Optional[str] = None) -> Dict[str, Any]:
-    """Stops currently playing audio in the guild voice channel."""
-    gid = _resolve_guild_id(guild_id)
-    stopped = voice.stop_audio(gid)
-    return {"success": stopped, "guild_id": str(gid)}
+    """Stops currently playing audio in Discord voice channels."""
+    import subprocess
+    subprocess.run(["pkill", "-f", "play_song.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"success": True, "message": "Audio playback stopped."}
 
 
 @mcp.tool()
