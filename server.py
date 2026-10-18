@@ -1,7 +1,7 @@
 """
 Discord Bot MCP Server.
 Provides full Discord administration, messaging, file attachments,
-inbox message polling, and voice channel audio streaming via FastMCP.
+and voice channel audio streaming via FastMCP.
 """
 
 from __future__ import annotations
@@ -18,15 +18,12 @@ import discord
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 
-from inbox_db import enqueue_message, get_pending, mark_processed
 from voice_controller import VoiceController
 
 # Load environment configuration
 load_dotenv(Path(__file__).parent / ".env")
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 DEFAULT_GUILD_ID = os.getenv("DISCORD_DEFAULT_GUILD_ID", "").strip()
-AUTO_QUEUE_MENTIONS = os.getenv("AUTO_QUEUE_MENTIONS", "true").lower() == "true"
-AUTO_QUEUE_ALL = os.getenv("AUTO_QUEUE_ALL_MESSAGES", "false").lower() == "true"
 
 # Setup logging to stderr ONLY (keep stdout clean for JSON-RPC transport)
 logging.basicConfig(
@@ -66,34 +63,6 @@ async def on_error(event, *args, **kwargs):
     logger.error("Unhandled Discord event error in %s", event, exc_info=True)
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    # Ignore own messages
-    if message.author == bot.user:
-        return
-
-    is_mention = bot.user in message.mentions if bot.user else False
-    should_queue = is_mention if AUTO_QUEUE_MENTIONS else False
-    if AUTO_QUEUE_ALL:
-        should_queue = True
-
-    if should_queue:
-        attachments = [att.url for att in message.attachments]
-        channel_name = getattr(message.channel, "name", "DM")
-        guild_id = str(message.guild.id) if message.guild else None
-
-        enqueue_message(
-            message_id=str(message.id),
-            channel_id=str(message.channel.id),
-            channel_name=channel_name,
-            guild_id=guild_id,
-            author_id=str(message.author.id),
-            author_name=str(message.author),
-            content=message.content,
-            is_mention=is_mention,
-            attachments=attachments,
-        )
-        logger.info("Enqueued incoming message %s from %s in #%s", message.id, message.author, channel_name)
 
 
 # ---------------------------------------------------------
@@ -203,14 +172,19 @@ async def discord_create_text_channel(
     if not guild:
         return {"error": f"Guild {gid} not found"}
 
-    category = guild.get_channel(int(category_id)) if category_id else None
-    new_ch = await guild.create_text_channel(name=name, category=category, topic=topic)
-    return {
-        "success": True,
-        "id": str(new_ch.id),
-        "name": new_ch.name,
-        "guild_id": str(guild.id),
-    }
+    try:
+        category = guild.get_channel(int(category_id)) if category_id else None
+        new_ch = await guild.create_text_channel(name=name, category=category, topic=topic)
+        return {
+            "success": True,
+            "id": str(new_ch.id),
+            "name": new_ch.name,
+            "guild_id": str(guild.id),
+        }
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Create text channel error: %s", err_msg)
+        return {"error": err_msg}
 
 
 @mcp.tool()
@@ -225,14 +199,19 @@ async def discord_create_voice_channel(
     if not guild:
         return {"error": f"Guild {gid} not found"}
 
-    category = guild.get_channel(int(category_id)) if category_id else None
-    new_vc = await guild.create_voice_channel(name=name, category=category)
-    return {
-        "success": True,
-        "id": str(new_vc.id),
-        "name": new_vc.name,
-        "guild_id": str(guild.id),
-    }
+    try:
+        category = guild.get_channel(int(category_id)) if category_id else None
+        new_vc = await guild.create_voice_channel(name=name, category=category)
+        return {
+            "success": True,
+            "id": str(new_vc.id),
+            "name": new_vc.name,
+            "guild_id": str(guild.id),
+        }
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Create voice channel error: %s", err_msg)
+        return {"error": err_msg}
 
 
 @mcp.tool()
@@ -242,9 +221,14 @@ async def discord_delete_channel(channel_id: str, reason: Optional[str] = None) 
     if not ch:
         return {"error": f"Channel {channel_id} not found"}
 
-    name = ch.name
-    await ch.delete(reason=reason)
-    return {"success": True, "deleted_channel_id": channel_id, "name": name}
+    try:
+        name = ch.name
+        await ch.delete(reason=reason)
+        return {"success": True, "deleted_channel_id": channel_id, "name": name}
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Delete channel error: %s", err_msg)
+        return {"error": err_msg}
 
 
 @mcp.tool()
@@ -255,8 +239,13 @@ async def discord_create_category(name: str, guild_id: Optional[str] = None) -> 
     if not guild:
         return {"error": f"Guild {gid} not found"}
 
-    cat = await guild.create_category(name=name)
-    return {"success": True, "id": str(cat.id), "name": cat.name}
+    try:
+        cat = await guild.create_category(name=name)
+        return {"success": True, "id": str(cat.id), "name": cat.name}
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Create category error: %s", err_msg)
+        return {"error": err_msg}
 
 
 @mcp.tool()
@@ -266,9 +255,14 @@ async def discord_delete_category(category_id: str, reason: Optional[str] = None
     if not ch or not isinstance(ch, discord.CategoryChannel):
         return {"error": f"Category {category_id} not found"}
 
-    name = ch.name
-    await ch.delete(reason=reason)
-    return {"success": True, "deleted_category_id": category_id, "name": name}
+    try:
+        name = ch.name
+        await ch.delete(reason=reason)
+        return {"success": True, "deleted_category_id": category_id, "name": name}
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Delete category error: %s", err_msg)
+        return {"error": err_msg}
 
 
 # ---------------------------------------------------------
@@ -323,6 +317,43 @@ async def discord_send_message(
 
 
 @mcp.tool()
+async def discord_create_thread(
+    name: str,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    auto_archive_duration: int = 1440,
+) -> Dict[str, Any]:
+    """
+    Creates a new public thread either attached to an existing message or directly in a channel.
+    """
+    try:
+        if message_id and channel_id:
+            ch = bot.get_channel(int(channel_id))
+            if not ch:
+                return {"error": f"Channel {channel_id} not found"}
+            msg = await ch.fetch_message(int(message_id))
+            thread = await msg.create_thread(name=name, auto_archive_duration=auto_archive_duration)
+        elif channel_id:
+            ch = bot.get_channel(int(channel_id))
+            if not ch or not hasattr(ch, "create_thread"):
+                return {"error": f"Channel {channel_id} cannot create threads"}
+            thread = await ch.create_thread(name=name, auto_archive_duration=auto_archive_duration)
+        else:
+            return {"error": "Either channel_id or both channel_id and message_id must be provided"}
+
+        return {
+            "success": True,
+            "id": str(thread.id),
+            "name": thread.name,
+            "parent_id": str(thread.parent_id),
+        }
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Create thread error: %s", err_msg)
+        return {"error": err_msg}
+
+
+@mcp.tool()
 async def discord_read_messages(channel_id: str, limit: int = 20) -> List[Dict[str, Any]]:
     """Reads recent messages from a channel."""
     channel = bot.get_channel(int(channel_id))
@@ -354,68 +385,6 @@ async def discord_add_reaction(channel_id: str, message_id: str, emoji: str) -> 
     await msg.add_reaction(emoji)
     return {"success": True, "message_id": message_id, "emoji": emoji}
 
-
-# ---------------------------------------------------------
-# MCP Tools: Pending Inbox Queue & Auto-Polling
-# ---------------------------------------------------------
-
-@mcp.tool()
-async def discord_poll_inbox(limit: int = 20, channel_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Polls the persistent inbox for unread / pending messages that mentioned the bot.
-    Use this to review incoming tasks or queries from Discord users.
-    """
-    return get_pending(limit=limit, channel_id=channel_id)
-
-
-@mcp.tool()
-async def discord_mark_inbox_processed(message_id: str, status: str = "processed") -> Dict[str, Any]:
-    """Marks a pending inbox message as 'processed' or 'ignored'."""
-    ok = mark_processed(message_id=message_id, status=status)
-    return {"success": ok, "message_id": message_id, "status": status}
-
-
-@mcp.tool()
-async def discord_reply_to_inbox(
-    message_id: str,
-    reply_content: str,
-    file_paths: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """
-    Replies directly to a queued inbox message, mentions the author, and marks it processed.
-    """
-    # Find the message across guild text channels
-    target_msg = None
-    for guild in bot.guilds:
-        for ch in guild.text_channels:
-            try:
-                target_msg = await ch.fetch_message(int(message_id))
-                break
-            except Exception:
-                continue
-        if target_msg:
-            break
-
-    if not target_msg:
-        return {"error": f"Message {message_id} could not be located in any channel"}
-
-    files_to_send = []
-    if file_paths:
-        for p in file_paths:
-            path_obj = Path(p).expanduser().resolve()
-            if not path_obj.exists():
-                return {"error": f"Attachment file not found: {p}"}
-            files_to_send.append(discord.File(str(path_obj)))
-
-    reply = await target_msg.reply(content=reply_content, files=files_to_send if files_to_send else None)
-    mark_processed(message_id=message_id, status="processed")
-
-    return {
-        "success": True,
-        "reply_id": str(reply.id),
-        "in_response_to": message_id,
-        "channel_id": str(target_msg.channel.id),
-    }
 
 
 # ---------------------------------------------------------
@@ -453,8 +422,9 @@ async def discord_play_audio(
     volume: float = 1.0,
 ) -> Dict[str, Any]:
     """
-    Streams an audio file (e.g. MP3, WAV) or web stream into the specified voice channel.
-    audio_source: Local path to an audio file or direct HTTP stream URL.
+    Streams audio into the specified Discord voice channel.
+    `channel_id`: The ID of the Discord voice channel (e.g. from `discord_list_channels`).
+    `audio_source`: Can be a YouTube URL (e.g. 'https://www.youtube.com/watch?v=...'), a local audio file path (e.g. '/tmp/stefan_theme.mp3'), or a direct stream URL.
     """
     ch = bot.get_channel(int(channel_id))
     if not ch or not isinstance(ch, discord.VoiceChannel):
@@ -464,8 +434,9 @@ async def discord_play_audio(
         res = await voice.play_audio(ch, audio_source=audio_source, volume=volume)
         return {"success": True, **res}
     except Exception as e:
-        logger.error("Audio playback error: %s", e, exc_info=True)
-        return {"error": str(e)}
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Audio playback error: %s", err_msg, exc_info=True)
+        return {"error": err_msg}
 
 
 @mcp.tool()

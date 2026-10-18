@@ -19,13 +19,7 @@ A high-performance, native Python MCP (Model Context Protocol) server powered by
    - `discord_read_messages`: Read recent history with attachments and emoji reactions.
    - `discord_add_reaction`: React to messages with emojis.
 
-4. **Inbox Queue & Autonomous Polling**:
-   - Background listener automatically records mentions and incoming messages to a local SQLite database (`discord_inbox.sqlite3`).
-   - `discord_poll_inbox`: Fetch unread/pending messages.
-   - `discord_reply_to_inbox`: Reply directly to a queued message and mark it processed.
-   - `discord_mark_inbox_processed`: Mark items as resolved.
-
-5. **Voice Channel Audio Streaming**:
+4. **Voice Channel Audio Streaming**:
    - `discord_join_voice`: Connect the bot to any voice channel.
    - `discord_leave_voice`: Disconnect from voice.
    - `discord_play_audio`: Stream local audio files (MP3, WAV) or web audio streams via FFmpeg.

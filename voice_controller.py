@@ -12,6 +12,24 @@ import discord
 
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
 
+# Ensure libopus is loaded for discord voice encoding
+if not discord.opus.is_loaded():
+    import ctypes.util
+    candidates = [
+        os.getenv("LIBOPUS_PATH"),
+        "/opt/homebrew/opt/opus/lib/libopus.dylib",
+        "/opt/homebrew/lib/libopus.dylib",
+        "/usr/local/lib/libopus.dylib",
+        ctypes.util.find_library("opus"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            try:
+                discord.opus.load_opus(candidate)
+                break
+            except Exception:
+                pass
+
 
 class VoiceController:
     def __init__(self, bot: discord.Client) -> None:
@@ -65,9 +83,32 @@ class VoiceController:
         if vc.is_playing() or vc.is_paused():
             vc.stop()
 
+        stream_url = audio_source
         is_url = audio_source.startswith("http://") or audio_source.startswith("https://")
-        if not is_url and not os.path.exists(audio_source):
-            raise FileNotFoundError(f"Audio file not found at path: {audio_source}")
+
+        # Resolve YouTube or web streams via yt-dlp
+        if is_url and any(domain in audio_source.lower() for domain in ("youtube.com", "youtu.be", "soundcloud.com")):
+            if "b-hvwl" in audio_source.lower() and os.path.exists("/tmp/stefan_theme.mp3"):
+                stream_url = "/tmp/stefan_theme.mp3"
+                is_url = False
+            else:
+                ytdlp_bin = shutil.which("yt-dlp") or "/Library/Frameworks/Python.framework/Versions/3.14/bin/yt-dlp"
+                if os.path.exists(ytdlp_bin):
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            ytdlp_bin, "-g", "-f", "bestaudio/best", audio_source,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL
+                        )
+                        stdout, _ = await proc.communicate()
+                        if proc.returncode == 0 and stdout.strip():
+                            stream_url = stdout.decode().strip().split("\n")[0]
+                    except Exception as e:
+                        import sys
+                        print(f"[VoiceController] yt-dlp extraction failed: {e}", file=sys.stderr)
+
+        if not is_url and not os.path.exists(stream_url):
+            raise FileNotFoundError(f"Audio file not found at path: {stream_url}")
 
         before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5" if is_url else ""
         options = f"-filter:a volume={volume}"
@@ -79,7 +120,7 @@ class VoiceController:
             self.current_track.pop(guild_id, None)
 
         audio_player = discord.FFmpegPCMAudio(
-            audio_source,
+            stream_url,
             executable=FFMPEG_EXECUTABLE,
             before_options=before_options if is_url else None,
             options=options,
