@@ -1,31 +1,37 @@
 """
-Discord Bot MCP Server.
-Provides full Discord administration, messaging, file attachments,
-and voice channel audio streaming via FastMCP.
+Discord Bot MCP Server & AI Agent Gateway.
+Provides Discord administration, messaging, file attachments,
+voice channel audio streaming, and an AI Agent server mode.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+from dataclasses import dataclass, field
 import json
 import logging
 import os
-import sys
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import sys
+from typing import Any, Dict, List, Optional, Set
 
 import discord
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 
+from agent_bridge import (
+    DEFAULT_DISCORD_SYSTEM_PROMPT,
+    AgentBridge,
+    split_discord_message,
+)
 from voice_controller import VoiceController
 
 # Load environment configuration
 load_dotenv(Path(__file__).parent / ".env")
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-DEFAULT_GUILD_ID = os.getenv("DISCORD_DEFAULT_GUILD_ID", "").strip()
 
-# Setup logging to stderr ONLY (keep stdout clean for JSON-RPC transport)
+# Setup logging to stderr ONLY (keeps stdout clean for MCP JSON-RPC transport)
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
@@ -33,11 +39,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger("discord-bot-mcp")
 
-# Initialize Discord client
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+def _parse_user_ids(raw: Optional[str]) -> Set[str]:
+    """Parses comma-separated Discord user IDs into a set of strings."""
+    if not raw:
+        return set()
+    return {uid.strip() for uid in raw.split(",") if uid.strip()}
+
+
+@dataclass
+class ServerConfig:
+    bot_token: str = field(default_factory=lambda: os.getenv("DISCORD_BOT_TOKEN", "").strip())
+    default_guild_id: str = field(default_factory=lambda: os.getenv("DISCORD_DEFAULT_GUILD_ID", "").strip())
+    allowed_users: Set[str] = field(default_factory=lambda: _parse_user_ids(os.getenv("DISCORD_ALLOWED_USERS", "")))
+    agent_backend: str = field(default_factory=lambda: os.getenv("DISCORD_AGENT_BACKEND", "antigravity").strip().lower())
+    agent_bin: Optional[str] = field(default_factory=lambda: os.getenv("DISCORD_AGENT_BIN", None))
+    agent_model: Optional[str] = field(default_factory=lambda: os.getenv("DISCORD_AGENT_MODEL", None))
+    system_prompt: Optional[str] = field(default_factory=lambda: os.getenv("DISCORD_SYSTEM_PROMPT", None))
+    custom_cmd: Optional[str] = field(default_factory=lambda: os.getenv("DISCORD_AGENT_CUSTOM_CMD", None))
+    allow_dms: bool = True
+    allow_mentions: bool = True
+    agent_mode: bool = False
+    silent_reject: bool = field(default_factory=lambda: os.getenv("DISCORD_SILENT_REJECT", "false").lower() == "true")
+
+
+CONFIG = ServerConfig()
+AGENT: Optional[AgentBridge] = None
+
+# Initialize Discord client with required intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.messages = True
+intents.dm_messages = True
+intents.guild_messages = True
 intents.voice_states = True
 
 bot = discord.Client(intents=intents)
@@ -56,6 +95,10 @@ async def on_ready():
     logger.info("Discord Bot connected as %s (ID: %s)", bot.user, bot.user.id if bot.user else "Unknown")
     for guild in bot.guilds:
         logger.info("Connected to Guild: %s (ID: %s)", guild.name, guild.id)
+    if CONFIG.allowed_users:
+        logger.info("Security Whitelist: %d allowed user ID(s) active (%s)", len(CONFIG.allowed_users), ", ".join(sorted(CONFIG.allowed_users)))
+    else:
+        logger.warning("Security Whitelist: No allowed users configured! Bot will ignore all incoming agent prompts.")
 
 
 @bot.event
@@ -63,6 +106,94 @@ async def on_error(event, *args, **kwargs):
     logger.error("Unhandled Discord event error in %s", event, exc_info=True)
 
 
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore messages sent by bots (including ourself)
+    if message.author.bot or message.author == bot.user:
+        return
+
+    # Check if agent responder is active
+    if not CONFIG.agent_mode:
+        return
+
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mention = bot.user in message.mentions if bot.user else False
+
+    # Check trigger condition (Direct Message or @Mention)
+    if not ((is_dm and CONFIG.allow_dms) or (is_mention and CONFIG.allow_mentions)):
+        return
+
+    author_id = str(message.author.id)
+    user_display = f"{message.author} (ID: {author_id})"
+
+    # Whitelist authorization verification
+    if CONFIG.allowed_users and author_id not in CONFIG.allowed_users:
+        logger.warning("[SECURITY] Rejected message from unauthorized user %s", user_display)
+        if not CONFIG.silent_reject:
+            denied_msg = (
+                f"⛔ **Access Denied**: You are not authorized to use this AI agent.\n"
+                f"Your Discord User ID is: `{author_id}`\n"
+                f"Ask the server administrator to add your ID to the allowed list (`--allowed-users` or `DISCORD_ALLOWED_USERS` in `.env`)."
+            )
+            try:
+                await message.reply(denied_msg, mention_author=False)
+            except Exception as e:
+                logger.error("Failed to send unauthorized notification: %s", e)
+        return
+
+    # Extract and clean the prompt content
+    raw_content = message.content or ""
+    if bot.user:
+        raw_content = re.sub(rf"<@!?{bot.user.id}>", "", raw_content)
+    clean_prompt = raw_content.strip()
+
+    if not clean_prompt:
+        await message.reply(
+            "👋 **Hello!** I am your connected AI Agent. Send me a question, task, or request and I'll respond right here!",
+            mention_author=False,
+        )
+        return
+
+    logger.info("Processing prompt from %s in %s: %s", user_display, message.channel, clean_prompt[:80])
+
+    # Show Discord typing indicator while generating AI response
+    try:
+        async with message.channel.typing():
+            global AGENT
+            if AGENT is None:
+                AGENT = AgentBridge(
+                    backend=CONFIG.agent_backend,
+                    agent_bin=CONFIG.agent_bin,
+                    model=CONFIG.agent_model,
+                    system_prompt=CONFIG.system_prompt,
+                    custom_cmd=CONFIG.custom_cmd,
+                )
+
+            reply_text = await AGENT.execute(clean_prompt, user_name=str(message.author))
+            raw_chunks = split_discord_message(reply_text)
+            chunks = [c.strip() for c in raw_chunks if c and c.strip()]
+            if not chunks:
+                chunks = ["🤖 *(The agent processed your message, but the reply was blank. Please try asking again!)*"]
+
+            # Reply with the first chunk
+            await message.reply(chunks[0], mention_author=False)
+
+            # Send any subsequent chunks sequentially
+            for chunk in chunks[1:]:
+                if chunk and chunk.strip():
+                    await message.channel.send(chunk.strip())
+
+            logger.info("Successfully delivered response (%d chunk(s)) to %s", len(chunks), user_display)
+
+    except Exception as exc:
+        logger.error("Agent execution failed for user %s: %s", user_display, exc, exc_info=True)
+        try:
+            err_msg = f"❌ **Agent Error**: {str(exc)}"
+            if not err_msg.strip():
+                err_msg = "❌ **Agent Error**: An unexpected internal error occurred."
+            await message.reply(err_msg, mention_author=False)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------
@@ -70,7 +201,7 @@ async def on_error(event, *args, **kwargs):
 # ---------------------------------------------------------
 
 def _resolve_guild_id(guild_id: Optional[str] = None) -> int:
-    gid = guild_id or DEFAULT_GUILD_ID
+    gid = guild_id or CONFIG.default_guild_id
     if not gid:
         if bot.guilds:
             return bot.guilds[0].id
@@ -79,22 +210,52 @@ def _resolve_guild_id(guild_id: Optional[str] = None) -> int:
 
 
 # ---------------------------------------------------------
-# MCP Tools: Identity & Discovery
+# MCP Tools: Identity & Status
 # ---------------------------------------------------------
 
 @mcp.tool()
-async def discord_whoami() -> Dict[str, Any]:
-    """Returns the bot's username, ID, connection status, and list of servers."""
+async def discord_status() -> Dict[str, Any]:
+    """
+    Returns the bot's connection status, validity, latency, user profile, and guild list.
+    Verifies whether the bot is validly connected to Discord.
+    """
     if not bot.is_ready():
-        return {"status": "connecting", "user": None, "guilds": []}
+        return {
+            "valid": False,
+            "status": "connecting" if CONFIG.bot_token else "invalid_token",
+            "message": "Discord bot is not connected or token is missing/invalid.",
+            "bot_user": None,
+            "guilds": [],
+            "allowed_users_count": len(CONFIG.allowed_users),
+            "agent_backend": CONFIG.agent_backend,
+        }
 
     return {
+        "valid": True,
         "status": "ready",
         "username": str(bot.user),
         "id": str(bot.user.id),
         "avatar_url": str(bot.user.avatar.url) if bot.user.avatar else None,
-        "guilds": [{"id": str(g.id), "name": g.name, "member_count": g.member_count} for g in bot.guilds],
+        "latency_ms": round(bot.latency * 1000, 2) if bot.latency else 0.0,
+        "guilds_count": len(bot.guilds),
+        "guilds": [
+            {"id": str(g.id), "name": g.name, "member_count": g.member_count}
+            for g in bot.guilds
+        ],
+        "allowed_users_count": len(CONFIG.allowed_users),
+        "allowed_users": list(sorted(CONFIG.allowed_users)),
+        "agent_backend": CONFIG.agent_backend,
+        "agent_mode_active": CONFIG.agent_mode,
     }
+
+
+@mcp.tool()
+async def discord_whoami() -> Dict[str, Any]:
+    """
+    Backwards-compatible alias for discord_status.
+    Returns the bot's username, ID, connection status, and list of servers.
+    """
+    return await discord_status()
 
 
 @mcp.tool()
@@ -317,6 +478,63 @@ async def discord_send_message(
 
 
 @mcp.tool()
+async def discord_send_direct_message(
+    user_id: str,
+    content: str = "",
+    embed_title: Optional[str] = None,
+    embed_description: Optional[str] = None,
+    embed_color: int = 0x5865F2,
+    file_paths: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Sends a direct message (DM) to a specific Discord user by their User ID.
+    `user_id`: Numeric Discord Snowflake User ID.
+    """
+    try:
+        uid = int(user_id)
+        user = bot.get_user(uid)
+        if not user:
+            user = await bot.fetch_user(uid)
+        if not user:
+            return {"error": f"User {user_id} not found"}
+
+        embed = None
+        if embed_title or embed_description:
+            embed = discord.Embed(
+                title=embed_title,
+                description=embed_description,
+                color=embed_color,
+            )
+
+        files_to_send = []
+        if file_paths:
+            for p in file_paths:
+                path_obj = Path(p).expanduser().resolve()
+                if not path_obj.exists():
+                    return {"error": f"Attachment file not found: {p}"}
+                files_to_send.append(discord.File(str(path_obj)))
+
+        msg = await user.send(
+            content=content if content else None,
+            embed=embed,
+            files=files_to_send if files_to_send else None,
+        )
+
+        return {
+            "success": True,
+            "message_id": str(msg.id),
+            "recipient_id": str(user.id),
+            "recipient_username": str(user),
+            "dm_channel_id": str(msg.channel.id),
+            "attachments_count": len(msg.attachments),
+        }
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+        logger.error("Direct message error: %s", err_msg)
+        return {"error": err_msg}
+
+
+@mcp.tool()
 async def discord_create_thread(
     name: str,
     channel_id: Optional[str] = None,
@@ -386,7 +604,6 @@ async def discord_add_reaction(channel_id: str, message_id: str, emoji: str) -> 
     return {"success": True, "message_id": message_id, "emoji": emoji}
 
 
-
 # ---------------------------------------------------------
 # MCP Tools: Voice & Audio Streaming
 # ---------------------------------------------------------
@@ -424,16 +641,14 @@ async def discord_play_audio(
     """
     Streams audio into the specified Discord voice channel.
     `channel_id`: The ID of the Discord voice channel (e.g. from `discord_list_channels`).
-    `audio_source`: Can be a YouTube URL (e.g. 'https://www.youtube.com/watch?v=...'), a local audio file path (e.g. '/tmp/stefan_theme.mp3'), or a direct stream URL.
+    `audio_source`: Can be a YouTube URL, local audio file path, or direct audio stream URL.
     """
     import subprocess
-    # Stop any prior detached play_song processes
     subprocess.run(["pkill", "-f", "play_song.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     script_path = os.path.join(os.path.dirname(__file__), "play_song.py")
     python_bin = sys.executable
 
-    # Spawn in a detached session so audio playback continues independently of stdio MCP lifecycle
     proc = subprocess.Popen(
         [python_bin, script_path, str(channel_id), str(audio_source)],
         stdout=subprocess.DEVNULL,
@@ -466,35 +681,179 @@ async def discord_voice_status(guild_id: Optional[str] = None) -> Dict[str, Any]
 
 
 # ---------------------------------------------------------
-# Main Server Runner
+# Lifecycle & Execution Runners
 # ---------------------------------------------------------
 
-async def main():
-    if not BOT_TOKEN:
-        logger.error("DISCORD_BOT_TOKEN environment variable is missing!")
-        sys.exit(1)
+async def _connect_discord_client() -> bool:
+    """Connects to Discord Gateway and waits for readiness."""
+    if not CONFIG.bot_token:
+        logger.error("DISCORD_BOT_TOKEN environment variable is missing or blank!")
+        return False
 
-    logger.info("Starting Discord Bot background connection...")
-    # Launch Discord gateway in the background
-    asyncio.create_task(bot.start(BOT_TOKEN))
-
-    # Wait for bot to be ready before accepting MCP traffic
-    timeout = 30
+    asyncio.create_task(bot.start(CONFIG.bot_token))
+    timeout = 25.0
     while not bot.is_ready() and timeout > 0:
         await asyncio.sleep(0.5)
         timeout -= 0.5
 
-    if bot.is_ready():
-        logger.info("Discord Bot is fully connected and ready.")
-    else:
-        logger.warning("Discord Bot took longer than 15s to connect; starting MCP server anyway.")
+    return bot.is_ready()
 
-    logger.info("Starting MCP stdio server transport...")
+
+async def run_mcp_server():
+    """Runs standard Model Context Protocol (MCP) server over stdio."""
+    logger.info("Initializing MCP Server transport...")
+    ready = await _connect_discord_client()
+    if ready:
+        logger.info("Discord Bot is ready for MCP requests.")
+    else:
+        logger.warning("Discord connection pending; starting MCP server anyway.")
+
     await mcp.run_stdio_async()
 
 
-if __name__ == "__main__":
+async def run_agent_server():
+    """Runs the Discord Bot as a foreground AI Agent gateway."""
+    logger.info("==================================================")
+    logger.info("Starting Discord AI Agent Gateway Server")
+    logger.info("Backend Agent: %s", CONFIG.agent_backend)
+    logger.info("Allowed Users: %s", ", ".join(sorted(CONFIG.allowed_users)) if CONFIG.allowed_users else "NONE (All ignored)")
+    logger.info("==================================================")
+
+    CONFIG.agent_mode = True
+    ready = await _connect_discord_client()
+    if not ready:
+        logger.error("Failed to connect to Discord! Check your DISCORD_BOT_TOKEN.")
+        sys.exit(1)
+
+    logger.info("Bot '%s' is ONLINE and listening for mentions and DMs...", bot.user)
     try:
-        asyncio.run(main())
+        # Keep running until cancelled
+        while True:
+            await asyncio.sleep(3600)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Agent Server stopped by user.")
+
+
+async def run_status_check():
+    """Runs a quick one-shot status check and reports connection state."""
+    print("Connecting to Discord Gateway to check credentials...", file=sys.stderr)
+    ready = await _connect_discord_client()
+    
+    print("\n" + "=" * 55)
+    print("Discord Bot Connection Status")
+    print("=" * 55)
+    if ready and bot.user:
+        ping = round(bot.latency * 1000, 2) if bot.latency else 0.0
+        print(f"Status:         VALID / CONNECTED")
+        print(f"Bot Username:   {bot.user}")
+        print(f"Bot User ID:    {bot.user.id}")
+        print(f"Gateway Ping:   {ping} ms")
+        print(f"Joined Guilds:  {len(bot.guilds)}")
+        for g in bot.guilds:
+            print(f"  - {g.name} (ID: {g.id}) | Members: {g.member_count}")
+        print(f"Allowed Users:  {len(CONFIG.allowed_users)} configured: {', '.join(sorted(CONFIG.allowed_users)) or 'None'}")
+        print(f"Agent Backend:  {CONFIG.agent_backend}")
+        print("=" * 55)
+        await bot.close()
+        sys.exit(0)
+    else:
+        print("Status:         INVALID / FAILED TO CONNECT")
+        print("Reason:         Could not connect to Discord. Verify DISCORD_BOT_TOKEN in .env")
+        print("=" * 55)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------
+# CLI Arguments Parser
+# ---------------------------------------------------------
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Discord Bot MCP Server & AI Agent Gateway",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command mode to run")
+
+    # Command: serve
+    serve_parser = subparsers.add_parser("serve", help="Run Discord bot as an autonomous AI Agent gateway")
+    serve_parser.add_argument(
+        "-u", "--allowed-users",
+        help="Comma-separated Discord User IDs allowed to interact with the bot (e.g. 1502871150676676749,123456789)",
+        type=str,
+        default=None,
+    )
+    serve_parser.add_argument(
+        "-a", "--agent",
+        help="AI backend tool to invoke (antigravity, gemini, claude, ollama, custom)",
+        default=None,
+    )
+    serve_parser.add_argument("--agent-bin", help="Path to AI tool executable", default=None)
+    serve_parser.add_argument("-m", "--model", help="AI model name override", default=None)
+    serve_parser.add_argument("--system-prompt", help="Custom Discord formatting system prompt", default=None)
+    serve_parser.add_argument("--silent-reject", action="store_true", help="Silently drop unauthorized messages")
+
+    # Command: mcp
+    mcp_parser = subparsers.add_parser("mcp", help="Run as an MCP stdio server for AI coding tools")
+    mcp_parser.add_argument(
+        "-u", "--allowed-users",
+        help="Comma-separated Discord User IDs allowed to interact with the bot",
+        type=str,
+        default=None,
+    )
+    mcp_parser.add_argument("--enable-agent", action="store_true", help="Also enable background agent responder in MCP mode")
+
+    # Command: status
+    subparsers.add_parser("status", help="Test credentials and print live Discord connection status")
+
+    return parser
+
+
+def main():
+    parser = build_cli_parser()
+    args, unknown = parser.parse_known_args()
+
+    # If flags like --allowed-users or --agent were passed to root or serve
+    if hasattr(args, "allowed_users") and args.allowed_users:
+        CONFIG.allowed_users = _parse_user_ids(args.allowed_users)
+
+    if hasattr(args, "agent") and args.agent:
+        CONFIG.agent_backend = args.agent.strip().lower()
+
+    if hasattr(args, "agent_bin") and args.agent_bin:
+        CONFIG.agent_bin = args.agent_bin
+
+    if hasattr(args, "model") and args.model:
+        CONFIG.agent_model = args.model
+
+    if hasattr(args, "system_prompt") and args.system_prompt:
+        CONFIG.system_prompt = args.system_prompt
+
+    if hasattr(args, "silent_reject") and args.silent_reject:
+        CONFIG.silent_reject = True
+
+    # Mode Dispatcher:
+    # 1) status -> quick CLI check
+    if args.command == "status":
+        asyncio.run(run_status_check())
+        return
+
+    # 2) serve -> interactive agent mode
+    if args.command == "serve":
+        try:
+            asyncio.run(run_agent_server())
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Agent Server shutdown.")
+        return
+
+    # 3) default or mcp -> standard MCP stdio mode
+    if hasattr(args, "enable_agent") and args.enable_agent:
+        CONFIG.agent_mode = True
+
+    try:
+        asyncio.run(run_mcp_server())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Discord Bot MCP Server shutting down.")
+        logger.info("MCP Server shutdown.")
+
+
+if __name__ == "__main__":
+    main()
