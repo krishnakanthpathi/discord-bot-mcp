@@ -41,15 +41,27 @@ Only user IDs in the whitelist can interact with the bot. Unauthorized users are
 
 ### Running Agent Mode
 ```bash
-# Start Agent Gateway mode using settings from .env
+# Start Agent Gateway mode in foreground
 ./.venv/bin/python3 server.py serve
 
+# Start as a detached background daemon
+./.venv/bin/python3 server.py serve -d
+
 # Or pass allowed users and backend directly via CLI
-./.venv/bin/python3 server.py serve --allowed-users 1502871150676676749 --agent antigravity
+./.venv/bin/python3 server.py serve -d --allowed-users 1502871150676676749 --agent antigravity
+```
+
+### Stopping the Agent Server / Daemon
+```bash
+# Gracefully stop running server instances / daemon
+./.venv/bin/python3 server.py stop
+
+# Force kill with SIGKILL if unresponsive
+./.venv/bin/python3 server.py stop --force
 ```
 
 ### CLI Status Check
-Quickly test your bot token and gateway connection:
+Check local server process status, bot token validity, and gateway connection:
 ```bash
 ./.venv/bin/python3 server.py status
 ```

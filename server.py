@@ -14,7 +14,10 @@ import logging
 import os
 import re
 from pathlib import Path
+import signal
+import subprocess
 import sys
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import discord
@@ -711,27 +714,131 @@ async def run_mcp_server():
     await mcp.run_stdio_async()
 
 
+PID_FILE = Path(__file__).parent / ".serve.pid"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Checks if a process ID is currently running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def get_running_server_pids() -> List[int]:
+    """Finds PIDs of running server.py instances for this workspace, excluding current process."""
+    current_pid = os.getpid()
+    server_path = str(Path(__file__).resolve())
+    found_pids: List[int] = []
+
+    # 1. Check PID file
+    if PID_FILE.exists():
+        try:
+            stored_pid = int(PID_FILE.read_text().strip())
+            if stored_pid != current_pid and _is_pid_alive(stored_pid):
+                found_pids.append(stored_pid)
+        except Exception:
+            pass
+
+    # 2. Check system process table via pgrep
+    try:
+        res = subprocess.run(["pgrep", "-f", f".*{server_path}.*"], capture_output=True, text=True)
+        if res.returncode == 0:
+            for line in res.stdout.strip().splitlines():
+                if line.strip():
+                    p = int(line.strip())
+                    if p != current_pid and p not in found_pids and _is_pid_alive(p):
+                        found_pids.append(p)
+    except Exception:
+        pass
+
+    return found_pids
+
+
+def run_stop_command(force: bool = False):
+    """Stops running Discord Bot server instances / daemon."""
+    pids = get_running_server_pids()
+    if not pids:
+        if PID_FILE.exists():
+            try:
+                PID_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        print("No running Discord Bot server daemon or process found.")
+        return
+
+    sig_name = "SIGKILL" if force else "SIGTERM"
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    print(f"Stopping {len(pids)} running Discord Bot server process(es): {pids}...")
+
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+            print(f"  Sent {sig_name} to PID {pid}")
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            print(f"  Error signaling PID {pid}: {e}")
+
+    # Wait up to 3 seconds for graceful shutdown
+    deadline = time.time() + 3.0
+    alive = pids
+    while time.time() < deadline and alive:
+        time.sleep(0.3)
+        alive = [p for p in alive if _is_pid_alive(p)]
+
+    # Force kill any stubborn processes
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            print(f"  Force stopped PID {pid} with SIGKILL")
+        except Exception:
+            pass
+
+    if PID_FILE.exists():
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    print("Discord Bot server stopped successfully.")
+
+
 async def run_agent_server():
-    """Runs the Discord Bot as a foreground AI Agent gateway."""
+    """Runs the Discord Bot as an AI Agent gateway."""
+    try:
+        PID_FILE.write_text(str(os.getpid()))
+    except Exception as e:
+        logger.warning("Could not write PID file: %s", e)
+
     logger.info("==================================================")
     logger.info("Starting Discord AI Agent Gateway Server")
+    logger.info("PID:           %d", os.getpid())
     logger.info("Backend Agent: %s", CONFIG.agent_backend)
     logger.info("Allowed Users: %s", ", ".join(sorted(CONFIG.allowed_users)) if CONFIG.allowed_users else "NONE (All ignored)")
     logger.info("==================================================")
 
     CONFIG.agent_mode = True
-    ready = await _connect_discord_client()
-    if not ready:
-        logger.error("Failed to connect to Discord! Check your DISCORD_BOT_TOKEN.")
-        sys.exit(1)
-
-    logger.info("Bot '%s' is ONLINE and listening for mentions and DMs...", bot.user)
     try:
+        ready = await _connect_discord_client()
+        if not ready:
+            logger.error("Failed to connect to Discord! Check your DISCORD_BOT_TOKEN.")
+            sys.exit(1)
+
+        logger.info("Bot '%s' is ONLINE and listening for mentions and DMs...", bot.user)
         # Keep running until cancelled
         while True:
             await asyncio.sleep(3600)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Agent Server stopped by user.")
+    finally:
+        if PID_FILE.exists():
+            try:
+                if PID_FILE.read_text().strip() == str(os.getpid()):
+                    PID_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 async def run_status_check():
@@ -742,9 +849,15 @@ async def run_status_check():
     print("\n" + "=" * 55)
     print("Discord Bot Connection Status")
     print("=" * 55)
+    running_pids = get_running_server_pids()
+    if running_pids:
+        print(f"Local Server:   RUNNING (PID: {', '.join(map(str, running_pids))})")
+    else:
+        print(f"Local Server:   STOPPED")
+
     if ready and bot.user:
         ping = round(bot.latency * 1000, 2) if bot.latency else 0.0
-        print(f"Status:         VALID / CONNECTED")
+        print(f"Gateway Status: VALID / CONNECTED")
         print(f"Bot Username:   {bot.user}")
         print(f"Bot User ID:    {bot.user.id}")
         print(f"Gateway Ping:   {ping} ms")
@@ -757,7 +870,7 @@ async def run_status_check():
         await bot.close()
         sys.exit(0)
     else:
-        print("Status:         INVALID / FAILED TO CONNECT")
+        print("Gateway Status: INVALID / FAILED TO CONNECT")
         print("Reason:         Could not connect to Discord. Verify DISCORD_BOT_TOKEN in .env")
         print("=" * 55)
         sys.exit(1)
@@ -777,6 +890,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     # Command: serve
     serve_parser = subparsers.add_parser("serve", help="Run Discord bot as an autonomous AI Agent gateway")
     serve_parser.add_argument(
+        "-d", "--daemon",
+        action="store_true",
+        help="Run detached in the background as a daemon process",
+    )
+    serve_parser.add_argument(
         "-u", "--allowed-users",
         help="Comma-separated Discord User IDs allowed to interact with the bot (e.g. 1502871150676676749,123456789)",
         type=str,
@@ -791,6 +909,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("-m", "--model", help="AI model name override", default=None)
     serve_parser.add_argument("--system-prompt", help="Custom Discord formatting system prompt", default=None)
     serve_parser.add_argument("--silent-reject", action="store_true", help="Silently drop unauthorized messages")
+
+    # Command: stop
+    stop_parser = subparsers.add_parser("stop", help="Stop running Discord Bot server instances / daemon")
+    stop_parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Force kill processes immediately with SIGKILL",
+    )
 
     # Command: mcp
     mcp_parser = subparsers.add_parser("mcp", help="Run as an MCP stdio server for AI coding tools")
@@ -832,20 +958,58 @@ def main():
         CONFIG.silent_reject = True
 
     # Mode Dispatcher:
-    # 1) status -> quick CLI check
+    # 1) stop -> stop daemon / running servers
+    if args.command == "stop":
+        run_stop_command(force=getattr(args, "force", False))
+        return
+
+    # 2) status -> quick CLI check
     if args.command == "status":
         asyncio.run(run_status_check())
         return
 
-    # 2) serve -> interactive agent mode
+    # 3) serve -> interactive or background daemon agent mode
     if args.command == "serve":
+        if getattr(args, "daemon", False):
+            log_file = Path(__file__).parent / "serve.log"
+            python_bin = sys.executable
+            script_path = str(Path(__file__).resolve())
+
+            daemon_cmd = [python_bin, script_path, "serve"]
+            if hasattr(args, "allowed_users") and args.allowed_users:
+                daemon_cmd.extend(["-u", args.allowed_users])
+            if hasattr(args, "agent") and args.agent:
+                daemon_cmd.extend(["-a", args.agent])
+            if hasattr(args, "agent_bin") and args.agent_bin:
+                daemon_cmd.extend(["--agent-bin", args.agent_bin])
+            if hasattr(args, "model") and args.model:
+                daemon_cmd.extend(["-m", args.model])
+            if hasattr(args, "system_prompt") and args.system_prompt:
+                daemon_cmd.extend(["--system-prompt", args.system_prompt])
+            if hasattr(args, "silent_reject") and args.silent_reject:
+                daemon_cmd.append("--silent-reject")
+
+            with open(log_file, "a") as f_out:
+                proc = subprocess.Popen(
+                    daemon_cmd,
+                    stdout=f_out,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    cwd=str(Path(__file__).parent),
+                )
+            PID_FILE.write_text(str(proc.pid))
+            print(f"Discord Agent Gateway Server started in background (PID: {proc.pid})")
+            print(f"Logs: {log_file}")
+            print("To stop: python server.py stop")
+            return
+
         try:
             asyncio.run(run_agent_server())
         except (KeyboardInterrupt, SystemExit):
             logger.info("Agent Server shutdown.")
         return
 
-    # 3) default or mcp -> standard MCP stdio mode
+    # 4) default or mcp -> standard MCP stdio mode
     if hasattr(args, "enable_agent") and args.enable_agent:
         CONFIG.agent_mode = True
 
